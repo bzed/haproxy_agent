@@ -1,0 +1,11 @@
+[Unit]
+Description=HAproxy cpu usage agent server
+
+[Service]
+User=nobody
+ExecStart=/usr/bin/hagentserver
+ReadOnlyDirectories=/proc
+PrivateTmp=yes
+
+[Install]
+WantedBy=sockets.target
