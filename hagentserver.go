@@ -15,7 +15,6 @@ limitations under the License.
 
 */
 
-
 package main
 
 import (
@@ -33,9 +32,9 @@ import (
 	"github.com/coreos/go-systemd/activation"
 )
 
-var last_health int32 = 100
-var last_idle int64 = 0
-var last_total int64 = 0
+var lastHealth int32 = 100
+var lastIdle int64
+var lastTotal int64
 
 func getCPUSample() (idle, total int64, err error) {
 	idle = 0
@@ -73,26 +72,26 @@ func calculateHealth(milliseconds int) {
 	for {
 		idle, total, err := getCPUSample()
 		if err != nil {
-			panic("Failed to read /proc/stats")
+			log.Fatal("Failed to read /proc/stats")
 			continue
 		}
-		idleTicks := float64(idle - atomic.LoadInt64(&last_idle))
-		totalTicks := float64(total - atomic.LoadInt64(&last_total))
+		idleTicks := float64(idle - atomic.LoadInt64(&lastIdle))
+		totalTicks := float64(total - atomic.LoadInt64(&lastTotal))
 		cpuUsage := float64(0.0)
 		if totalTicks > 0 {
 			cpuUsage = 100 * ((totalTicks - idleTicks) / totalTicks)
 		}
 
-		haproxy_health := int32(math.Floor(100 - cpuUsage))
+		haproxyHealth := int32(math.Floor(100 - cpuUsage))
 
 		// ensure we do not drain nodes...
-		if haproxy_health <= 0 {
-			haproxy_health = 1
+		if haproxyHealth <= 0 {
+			haproxyHealth = 1
 		}
 
-		atomic.StoreInt64(&last_idle, idle)
-		atomic.StoreInt64(&last_total, total)
-		atomic.StoreInt32(&last_health, haproxy_health)
+		atomic.StoreInt64(&lastIdle, idle)
+		atomic.StoreInt64(&lastTotal, total)
+		atomic.StoreInt32(&lastHealth, haproxyHealth)
 		time.Sleep(time.Duration(milliseconds) * time.Millisecond)
 	}
 }
@@ -103,7 +102,7 @@ func clientConnections(listener net.Listener) chan net.Conn {
 		for {
 			client, err := listener.Accept()
 			if client == nil {
-				log.Fatal("failed to accept: " + err.Error())
+				log.Fatalf("Failed to accept: %s", err.Error())
 				continue
 			}
 			ch <- client
@@ -112,51 +111,55 @@ func clientConnections(listener net.Listener) chan net.Conn {
 	return ch
 }
 
-func handleConnection(client net.Conn, log_requests bool) {
-	health := atomic.LoadInt32(&last_health)
+func handleConnection(client net.Conn, logRequests bool) {
+	health := atomic.LoadInt32(&lastHealth)
 	readyness := fmt.Sprintf("%d%% ready", health)
-	if log_requests {
+	if logRequests {
 		log.Println(client.RemoteAddr(), readyness)
 	}
-	client.Write([]byte(readyness + "\n"))
-	client.Close()
+	if _, err := client.Write([]byte(readyness + "\n")); err != nil {
+		log.Printf("Failed to write to connection: %s", err.Error())
+	}
+	if err := client.Close(); err != nil {
+		log.Printf("Failed to close client connection: %s", err.Error())
+	}
 }
 
 func main() {
 	debugPort := flag.Int("port", 7777, "tcp port to use (ignored if activated via systemd)")
 	timeframe := flag.Int("timeframe", 2000, "calculate cpu usage for this timeframe in milliseconds")
-	log_requests := flag.Bool("log-requests", false, "log each request with remote IP and returned health")
+	logRequests := flag.Bool("log-requests", false, "log each request with remote IP and returned health")
 	flag.Parse()
 
-	var tcp_listener net.Listener
+	var tcpListener net.Listener
 	var err error
-	use_systemd := false
+	useSystemd := false
 
-	systemd_listeners, err := activation.Listeners(true)
+	systemdListeners, err := activation.Listeners(true)
 	if err != nil {
-		panic("Failed to start systemd activation")
+		log.Fatal("Failed to start systemd activation")
 	}
-	if len(systemd_listeners) != 1 {
-		use_systemd = false
+	if len(systemdListeners) != 1 {
+		useSystemd = false
 	}
 
-	if use_systemd {
+	if useSystemd {
 		log.Println("Using systemd activation")
-		tcp_listener = systemd_listeners[0]
+		tcpListener = systemdListeners[0]
 	} else {
 		log.Println("Using normal tcp port")
-		tcp_listener, err = net.Listen("tcp", ":"+strconv.Itoa(*debugPort))
-		if tcp_listener == nil {
-			panic("couldn't start normal TCP listener: " + err.Error())
+		tcpListener, err = net.Listen("tcp", ":"+strconv.Itoa(*debugPort))
+		if tcpListener == nil {
+			log.Fatalf("Couldn't start a normal TCP listener: %s", err.Error())
 		}
-		log.Println("Listening on port", *debugPort)
+		log.Printf("Listening on port %d\n", *debugPort)
 	}
 
 	go calculateHealth(*timeframe)
 
-	connections := clientConnections(tcp_listener)
+	connections := clientConnections(tcpListener)
 	for {
-		go handleConnection(<-connections, *log_requests)
+		go handleConnection(<-connections, *logRequests)
 	}
 
 }
