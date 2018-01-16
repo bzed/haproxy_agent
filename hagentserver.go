@@ -31,16 +31,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/coreos/go-systemd/activation"
 )
-
-var lastHealth int32 = 100
-var lastIdle int64
-var lastTotal int64
 
 func getCPUSample() (idle, total int64, err error) {
 	idle = 0
@@ -74,13 +69,19 @@ func getCPUSample() (idle, total int64, err error) {
 	return
 }
 
-func updateHealthMetrics() error {
+func updateHealthMetrics(hlth *health) error {
+	var lastIdle, lastTotal int64
 	idle, total, err := getCPUSample()
 	if err != nil {
 		return errors.New("Failed to read /proc/stats")
 	}
-	idleTicks := float64(idle - atomic.LoadInt64(&lastIdle))
-	totalTicks := float64(total - atomic.LoadInt64(&lastTotal))
+	hlth.lock.RLock()
+	lastIdle = hlth.lastIdle
+	lastTotal = hlth.lastTotal
+	hlth.lock.RUnlock()
+
+	idleTicks := float64(idle - lastIdle)
+	totalTicks := float64(total - lastTotal)
 	cpuUsage := float64(0.0)
 	if totalTicks > 0 {
 		cpuUsage = 100 * ((totalTicks - idleTicks) / totalTicks)
@@ -93,13 +94,16 @@ func updateHealthMetrics() error {
 		haproxyHealth = 1
 	}
 
-	atomic.StoreInt64(&lastIdle, idle)
-	atomic.StoreInt64(&lastTotal, total)
-	atomic.StoreInt32(&lastHealth, haproxyHealth)
+	hlth.lock.Lock()
+	defer hlth.lock.Unlock()
+	hlth.UpdateFileStatus()
+	hlth.lastIdle = idle
+	hlth.lastTotal = total
+	hlth.lastHealth = haproxyHealth
 	return nil
 }
 
-func calculateHealth(ctx context.Context, milliseconds int) {
+func calculateHealth(ctx context.Context, hlth *health, milliseconds int) {
 	ticker := time.NewTicker(time.Duration(milliseconds) * time.Millisecond)
 	for {
 		select {
@@ -107,7 +111,7 @@ func calculateHealth(ctx context.Context, milliseconds int) {
 			return
 		case <-ticker.C:
 		}
-		if err := updateHealthMetrics(); err != nil {
+		if err := updateHealthMetrics(hlth); err != nil {
 			log.Fatalf("Failed to update metrics: %s", err.Error())
 		}
 	}
@@ -134,13 +138,15 @@ func clientConnections(ctx context.Context, listener net.Listener) chan net.Conn
 	return ch
 }
 
-func buildStatusMessage() string {
-	health := atomic.LoadInt32(&lastHealth)
-	return fmt.Sprintf("%d%% ready", health)
+func buildStatusMessage(hlth *health) string {
+	hlth.lock.RLock()
+	defer hlth.lock.RUnlock()
+	val := hlth.lastHealth
+	return fmt.Sprintf("%d%% %s", val, hlth.Status())
 }
 
-func handleConnection(client net.Conn, logRequests bool) {
-	readyness := buildStatusMessage()
+func handleConnection(client net.Conn, hlth *health, logRequests bool) {
+	readyness := buildStatusMessage(hlth)
 	if logRequests {
 		log.Println(client.RemoteAddr(), readyness)
 	}
@@ -152,7 +158,7 @@ func handleConnection(client net.Conn, logRequests bool) {
 	}
 }
 
-func runTCPListener(listener net.Listener, logRequests bool, refreshInterval int) error {
+func runTCPListener(listener net.Listener, hlth *health, logRequests bool, refreshInterval int) error {
 	sigChan := make(chan os.Signal, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,7 +183,7 @@ func runTCPListener(listener net.Listener, logRequests bool, refreshInterval int
 
 	wg.Add(1)
 	go func() {
-		calculateHealth(ctx, refreshInterval)
+		calculateHealth(ctx, hlth, refreshInterval)
 		wg.Done()
 	}()
 
@@ -193,7 +199,7 @@ connectionLoop:
 			}
 			wg.Add(1)
 			go func() {
-				handleConnection(conn, logRequests)
+				handleConnection(conn, hlth, logRequests)
 				wg.Done()
 			}()
 		}
@@ -206,11 +212,15 @@ func main() {
 	var debugPort int
 	var logRequests bool
 	var timeframe int
+	var drainFile string
+	var maintFile string
 
 	flag.BoolVar(&useSystemd, "systemd", false, "Use systemd activation mechanism")
 	flag.IntVar(&debugPort, "port", 0, "tcp port to use (ignored if activated via systemd)")
 	flag.IntVar(&timeframe, "timeframe", 2000, "calculate cpu usage for this timeframe in milliseconds")
 	flag.BoolVar(&logRequests, "log-requests", false, "log each request with remote IP and returned health")
+	flag.StringVar(&drainFile, "drain-file", "", "Path to a file that if present should set the status to 'drain'")
+	flag.StringVar(&maintFile, "maint-file", "", "Path to a file that if present should set the status to 'maint'")
 	flag.Parse()
 
 	if useSystemd && debugPort != 0 {
@@ -219,6 +229,12 @@ func main() {
 
 	var tcpListener net.Listener
 	var err error
+
+	hlth := health{
+		lastHealth: 100,
+		drainFile:  drainFile,
+		maintFile:  maintFile,
+	}
 
 	if useSystemd {
 		systemdListeners, err := activation.Listeners(true)
@@ -243,7 +259,7 @@ func main() {
 	// If we are operating as a server, we continually have to handle incoming
 	// connections and update the health status.
 	if useSystemd || debugPort != 0 {
-		if err := runTCPListener(tcpListener, logRequests, timeframe); err != nil {
+		if err := runTCPListener(tcpListener, &hlth, logRequests, timeframe); err != nil {
 			if err != context.Canceled {
 				log.Fatalf("TCP listener failed: %s", err.Error())
 			}
@@ -254,8 +270,8 @@ func main() {
 
 	// In the one-shot mode, we just update the metrics and print them to
 	// STDOUT.
-	if err := updateHealthMetrics(); err != nil {
+	if err := updateHealthMetrics(&hlth); err != nil {
 		log.Fatalf("Failed to update metrics: %s", err.Error())
 	}
-	fmt.Println(buildStatusMessage())
+	fmt.Println(buildStatusMessage(&hlth))
 }
